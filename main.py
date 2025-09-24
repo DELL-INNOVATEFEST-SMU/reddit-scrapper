@@ -33,6 +33,10 @@ class ScrapeRequest(BaseModel):
     subreddits: Dict[str, int]
 
 app = FastAPI()
+ALLOWED_ORIGINS = [
+    LAUNCHPAD_URL,
+    "https://launchpad-smu.apps.innovate.sg-cna.com",
+]
 
 app.add_middleware(
     CORSMiddleware,
