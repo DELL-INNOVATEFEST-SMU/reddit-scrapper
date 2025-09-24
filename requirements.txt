@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+supabase
+asyncpraw
+python-dotenv
+google-genai
+sentistrength
+pydantic
+pandas
