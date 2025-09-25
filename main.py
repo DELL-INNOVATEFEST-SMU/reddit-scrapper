@@ -151,7 +151,10 @@ async def analyze_and_save(subreddit_name: str, posts: list, buffer: list, batch
     # Batch flush to Supabase
     if len(buffer) >= batch_size:
         try:
-            await supabase.table("messages").insert(buffer).execute()
+            await supabase.table("messages").upsert(
+                buffer,
+                on_conflict=["link"],
+            ).execute()
             logging.info(f"💾 Inserted {len(buffer)} rows into Supabase (batch flush).")
             buffer.clear()
         except Exception as e:
@@ -192,7 +195,10 @@ async def main(subreddits: dict[str, int]):
     # Final flush if buffer has leftovers
     if buffer:
         try:
-            await supabase.table("messages").insert(buffer).execute()
+            await supabase.table("messages").upsert(
+                buffer,
+                on_conflict=["link"],
+            ).execute()
             logging.info(f"💾 Inserted final {len(buffer)} rows into Supabase.")
         except Exception as e:
             error_message = f"❌ Error inserting final batch into Supabase: {e}"
