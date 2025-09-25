@@ -1,0 +1,212 @@
+name: Build & Push to Harbor + Deploy to OpenShift (InnovateFest)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+# ----- Shared ENV used by both jobs -----
+env:
+  # App / image naming
+  APP_NAME: reddit-scrapper
+  REGISTRY: ihl-harbor.apps.innovate.sg-cna.com
+  HARBOR_PROJECT: ${{ secrets.HARBOR_PROJECT }}  # your team/project slug in Harbor
+  IMAGE_TAG: ${{ github.sha }}                   # immutable tag per commit
+
+jobs:
+  build-and-push:
+    name: Build Reddit-Scrapper and Push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}      # Keycloak username
+          password: ${{ secrets.HARBOR_CLI_SECRET }}    # Harbor profile -> "CLI secret"
+
+      - name: Build and Push (Dockerfile in /)
+        uses: docker/build-push-action@v6
+        with:
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.APP_NAME }}:latest
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.APP_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.APP_NAME }}:buildcache,mode=max
+          provenance: false
+
+  deploy:
+    name: Deploy to OpenShift
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    # Map secrets to env for convenient use in steps
+    env:
+      OPENSHIFT_SERVER: ${{ secrets.OPENSHIFT_SERVER }}
+      OPENSHIFT_TOKEN: ${{ secrets.OPENSHIFT_TOKEN }}
+      OPENSHIFT_NAMESPACE: ${{ secrets.OPENSHIFT_NAMESPACE }}
+
+    steps:
+      - name: Check required OpenShift secrets
+        id: check
+        run: |
+          missing=0
+          for v in OPENSHIFT_SERVER OPENSHIFT_TOKEN OPENSHIFT_NAMESPACE; do
+            if [ -z "${!v}" ]; then
+              echo "::notice title=Missing secret::$v is not set."
+              missing=1
+            fi
+          done
+          if [ $missing -eq 0 ]; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "ok=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install oc
+        if: ${{ steps.check.outputs.ok == 'true' }}
+        uses: redhat-actions/oc-installer@v1
+        with:
+          oc_version: 'latest'
+
+      - name: Login to OpenShift
+        if: ${{ steps.check.outputs.ok == 'true' }}
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ env.OPENSHIFT_SERVER }}
+          openshift_token: ${{ env.OPENSHIFT_TOKEN }}
+          namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+          insecure_skip_tls_verify: false
+
+      - name: Create/Update Harbor pull secret
+        if: ${{ steps.check.outputs.ok == 'true' }}
+        run: |
+          set -euo pipefail
+          SECRET=harbor-pull
+          SERVER="${{ env.REGISTRY }}"
+          USER="${{ secrets.HARBOR_USERNAME }}"
+          PASS="${{ secrets.HARBOR_CLI_SECRET }}"
+          NS="${{ env.OPENSHIFT_NAMESPACE }}"
+
+          if oc -n "$NS" get secret "$SECRET" >/dev/null 2>&1; then
+            oc -n "$NS" delete secret "$SECRET"
+          fi
+
+          oc -n "$NS" create secret docker-registry "$SECRET" \
+            --docker-server="$SERVER" \
+            --docker-username="$USER" \
+            --docker-password="$PASS"
+
+          oc -n "$NS" secrets link default "$SECRET" --for=pull || true
+          oc -n "$NS" secrets link builder "$SECRET" --for=pull || true
+
+      - name: Render manifests (Deployment, Service, Route) with small resources and no surge
+        if: ${{ steps.check.outputs.ok == 'true' }}
+        id: manifests
+        run: |
+          set -euo pipefail
+          IMAGE="${{ env.REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}"
+
+          cat > app.yaml <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: reddit-scrapper
+            labels: { app: reddit-scrapper }
+          spec:
+            replicas: 1
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 0
+                maxUnavailable: 1
+            selector:
+              matchLabels: { app: reddit-scrapper }
+            template:
+              metadata:
+                labels: { app: reddit-scrapper }
+              spec:
+                containers:
+                  - name: reddit-scrapper
+                    image: REPLACE_IMAGE
+                    imagePullPolicy: IfNotPresent
+                    ports: [ { containerPort: 5005 } ]
+                    resources:
+                      requests:
+                        cpu: "50m"
+                        memory: "64Mi"
+                      limits:
+                        cpu: "150m"
+                        memory: "256Mi"
+                    readinessProbe:
+                      httpGet: { path: "/", port: 5005 }
+                      initialDelaySeconds: 3
+                      periodSeconds: 10
+                    livenessProbe:
+                      httpGet: { path: "/", port: 5005 }
+                      initialDelaySeconds: 10
+                      periodSeconds: 20
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: reddit-scrapper
+            labels: { app: reddit-scrapper }
+          spec:
+            selector: { app: reddit-scrapper }
+            ports:
+              - name: http
+                port: 5005
+                targetPort: 5005
+          ---
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: reddit-scrapper
+            labels: { app: reddit-scrapper }
+          spec:
+            to: { kind: Service, name: reddit-scrapper }
+            port: { targetPort: http }
+            tls: { termination: edge }
+          YAML
+
+          sed -i "s|REPLACE_IMAGE|$IMAGE|g" app.yaml
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Apply manifests
+        if: ${{ steps.check.outputs.ok == 'true' }}
+        run: |
+          NS="${{ env.OPENSHIFT_NAMESPACE }}"
+          oc -n "$NS" apply -f app.yaml
+
+      - name: Wait for rollout
+        if: ${{ steps.check.outputs.ok == 'true' }}
+        run: |
+          oc -n "${{ env.OPENSHIFT_NAMESPACE }}" rollout status deployment/reddit-scrapper --timeout=15005s
+
+      - name: Show Route URL
+        if: ${{ steps.check.outputs.ok == 'true' }}
+        run: |
+          echo "---------------------------------------------------------------"
+          echo "Image deployed: ${{ steps.manifests.outputs.image }}"
+          URL=$(oc -n "${{ env.OPENSHIFT_NAMESPACE }}" get route/reddit-scrapper -o jsonpath='https://{.spec.host}')
+          echo "App URL: $URL"
+          echo "---------------------------------------------------------------"
+
+      - name: Skipped (missing secrets)
+        if: ${{ steps.check.outputs.ok != 'true' }}
+        run: |
+          echo "OpenShift deploy skipped because one or more of:"
+          echo "  - OPENSHIFT_SERVER"
+          echo "  - OPENSHIFT_TOKEN"
+          echo "  - OPENSHIFT_NAMESPACE"
+          echo "were not set as repository secrets."

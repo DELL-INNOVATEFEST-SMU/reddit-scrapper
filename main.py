@@ -7,7 +7,7 @@ import asyncpraw
 from google import genai
 from google.genai import types
 import re
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict
@@ -29,6 +29,7 @@ REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LAUNCHPAD_URL = os.getenv("LAUNCHPAD_URL")
+
 class ScrapeRequest(BaseModel):
     subreddits: Dict[str, int]
 
@@ -62,10 +63,11 @@ EMOJI_PATTERN = re.compile(
     "]+",
     flags=re.UNICODE,
 )
+INVISIBLE_PATTERN = re.compile(r'[\u200B\u200C\u200D\uFEFF\u00A0]')
 def remove_emojis(text: str) -> str:
-    return EMOJI_PATTERN.sub("", text)
-
-
+    text = EMOJI_PATTERN.sub("", text)       # Remove emojis
+    text = INVISIBLE_PATTERN.sub("", text)   # Remove zero-width/invisible chars
+    return text.strip()
 
 # Initialize clients asynchronously
 genai_client = genai.Client(api_key=GOOGLE_API_KEY)
@@ -89,17 +91,21 @@ LLM_CONCURRENCY = 5
 llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
 
 async def get_llm_reply(text: str):
-    payload = (
-        f"Provide a short, uplifting message within 130 words in response to the following:\n\n{text}. Redirect them to this website that allows them to go through a survey to determine their emotions if it was a planet. https://website-smu.apps.innovate.sg-cna.com/planet-quiz Be sure to include the exact link in your response."
-    )
-    response = genai_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=payload,
-        config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_budget=0)
-        ),
-    )
-    return response.text
+    try:
+        payload = (
+            f"Provide a short, uplifting message within 130 words in response to the following:\n\n{text}. Redirect them to this website that allows them to go through a survey to determine their emotions if it was a planet. https://website-smu.apps.innovate.sg-cna.com/planet-quiz Be sure to include the exact link in your response."
+        )
+        response = genai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=payload,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0)
+            ),
+        )
+        return response.text
+    except Exception as e:
+        logging.error(f"❌ Error generating LLM reply: {e}")
+        return "An uplifting message could not be generated at this time."
 
 async def get_llm_reply_safe(text: str):
     async with llm_semaphore:
@@ -114,8 +120,12 @@ async def analyze_and_save(subreddit_name: str, posts: list, buffer: list, batch
 
     texts = [p["title"] + " " + p["body"] for p in posts]
 
-    # Run one JVM call for ALL posts in this subreddit
-    results = await asyncio.to_thread(senti.getSentiment, texts, score="trinary")
+    try:
+        # Run one JVM call for ALL posts in this subreddit
+        results = await asyncio.to_thread(senti.getSentiment, texts, score="trinary")
+    except Exception as e:
+        logging.error(f"❌ Error running SentiStrength on r/{subreddit_name}: {e}")
+        return
 
     negative_tasks = []
     for post, sentiment in zip(posts, results):
@@ -138,10 +148,15 @@ async def analyze_and_save(subreddit_name: str, posts: list, buffer: list, batch
             "suggested_outreach": llm_reply,
         })
 
-        # Batch flush to Supabase
-        if len(buffer) >= batch_size:
+    # Batch flush to Supabase
+    if len(buffer) >= batch_size:
+        try:
             await supabase.table("messages").insert(buffer).execute()
             logging.info(f"💾 Inserted {len(buffer)} rows into Supabase (batch flush).")
+            buffer.clear()
+        except Exception as e:
+            logging.error(f"❌ Error inserting batch into Supabase: {e}")
+            # Optionally, you can decide to clear the buffer even on failure to prevent repeated attempts
             buffer.clear()
 
 async def main(subreddits: dict[str, int]):
@@ -149,6 +164,7 @@ async def main(subreddits: dict[str, int]):
     Main entrypoint for scraping and batch sentiment analysis.
     """
     buffer = []
+    errors = []
 
     for subreddit_name, limit in subreddits.items():
         logging.info(f"📡 Scraping r/{subreddit_name} (limit={limit})...")
@@ -156,25 +172,35 @@ async def main(subreddits: dict[str, int]):
         try:
             subreddit = await reddit.subreddit(subreddit_name)
             async for post in subreddit.new(limit=limit):
+                if post.selftext =="" and post.url!="":
+                    continue
                 posts.append({
                     "title": post.title,
                     "body": remove_emojis(post.selftext) or "",
                     "author": str(post.author) if post.author else "[deleted]",
-                    "url": post.url,
+                    "permalink": post.permalink,
                 })
-
+            
             # Batch analyze and save after collecting posts
             await analyze_and_save(subreddit_name, posts, buffer)
 
         except Exception as e:
-            logging.error(f"❌ Error fetching subreddit {subreddit_name}: {e}")
+            error_message = f"❌ Error fetching subreddit {subreddit_name}: {e}"
+            logging.error(error_message)
+            errors.append(error_message)
 
     # Final flush if buffer has leftovers
     if buffer:
-        await supabase.table("messages").insert(buffer).execute()
-        logging.info(f"💾 Inserted final {len(buffer)} rows into Supabase.")
+        try:
+            await supabase.table("messages").insert(buffer).execute()
+            logging.info(f"💾 Inserted final {len(buffer)} rows into Supabase.")
+        except Exception as e:
+            error_message = f"❌ Error inserting final batch into Supabase: {e}"
+            logging.error(error_message)
+            errors.append(error_message)
 
     logging.info("✅ Scraping completed.")
+    return {"status": "Scraping completed", "errors": errors}
 
 @app.get("/")
 async def root():
@@ -182,8 +208,19 @@ async def root():
 
 @app.post("/scrape")
 async def scrape_subreddits(request: ScrapeRequest):
-    await main(request.subreddits)
-    return {"status": "Scraping completed"}
+    try:
+        result = await main(request.subreddits)
+        if result["errors"]:
+            # If there were errors, return a 500 status with the error details
+            raise HTTPException(status_code=500, detail={"status": "Scraping completed with errors", "errors": result["errors"]})
+        
+        return {"status": "Scraping completed successfully"}
+    except HTTPException:
+        raise # Re-raise the HTTPException
+    except Exception as e:
+        # Catch any other unexpected errors
+        logging.error(f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5005)
