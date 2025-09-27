@@ -7,3 +7,4 @@ google-genai
 sentistrength
 pydantic
 pandas
+more_itertools
