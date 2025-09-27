@@ -146,7 +146,7 @@ jobs:
                       - name: SUPABASE_SERVICE_ROLE_KEY
                         value: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
                       - name: REDDIT_CLIENT_ID
-                        value: ${{ secrets.REDDIT_CLIENT_ID }}D
+                        value: ${{ secrets.REDDIT_CLIENT_ID }}
                       - name: REDDIT_CLIENT_SECRET
                         value: ${{ secrets.REDDIT_CLIENT_SECRET }}
                       - name: REDDIT_USER_AGENT
