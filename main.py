@@ -28,15 +28,14 @@ REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-LAUNCHPAD_URL = os.getenv("LAUNCHPAD_URL")
+LAUNCHPAD_URL = "https://launchpad-smu.apps.innovate.sg-cna.com"
 
 class ScrapeRequest(BaseModel):
     subreddits: Dict[str, int]
 
 app = FastAPI()
 ALLOWED_ORIGINS = [
-    LAUNCHPAD_URL,
-    "https://launchpad-smu.apps.innovate.sg-cna.com",
+    LAUNCHPAD_URL
 ]
 
 app.add_middleware(
