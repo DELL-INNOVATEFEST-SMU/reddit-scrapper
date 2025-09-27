@@ -30,6 +30,11 @@ REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LAUNCHPAD_URL = "https://launchpad-smu.apps.innovate.sg-cna.com"
 
+logging.info(f"🔑 REDDIT_CLIENT_ID={REDDIT_CLIENT_ID}")
+logging.info(f"🔑 REDDIT_CLIENT_SECRET={'set' if REDDIT_CLIENT_SECRET else 'MISSING'}")
+logging.info(f"🔑 REDDIT_USER_AGENT={REDDIT_USER_AGENT}")
+
+
 class ScrapeRequest(BaseModel):
     subreddits: Dict[str, int]
 
