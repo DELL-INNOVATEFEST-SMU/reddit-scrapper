@@ -37,6 +37,7 @@ jobs:
         with:
           file: ./Dockerfile
           push: true
+          no-cache: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
             ${{ env.REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.APP_NAME }}:latest
@@ -138,7 +139,7 @@ jobs:
                 containers:
                   - name: reddit-scrapper
                     image: REPLACE_IMAGE
-                    imagePullPolicy: IfNotPresent
+                    imagePullPolicy: Always
                     ports: [ { containerPort: 5005 } ]
                     env:
                       - name: SUPABASE_URL
