@@ -135,6 +135,8 @@ jobs:
             template:
               metadata:
                 labels: { app: reddit-scrapper }
+                annotations:
+                  redeploy-hash: "${{ github.sha }}"
               spec:
                 containers:
                   - name: reddit-scrapper
