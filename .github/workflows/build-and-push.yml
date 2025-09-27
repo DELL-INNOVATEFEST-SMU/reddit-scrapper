@@ -140,6 +140,19 @@ jobs:
                     image: REPLACE_IMAGE
                     imagePullPolicy: IfNotPresent
                     ports: [ { containerPort: 5005 } ]
+                    env:
+                      - name: SUPABASE_URL
+                        value: ${{ secrets.SUPABASE_URL }}
+                      - name: SUPABASE_SERVICE_ROLE_KEY
+                        value: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+                      - name: REDDIT_CLIENT_ID
+                        value: ${{ secrets.REDDIT_CLIENT_ID }}D
+                      - name: REDDIT_CLIENT_SECRET
+                        value: ${{ secrets.REDDIT_CLIENT_SECRET }}
+                      - name: REDDIT_USER_AGENT
+                        value: ${{ secrets.REDDIT_USER_AGENT }}
+                      - name: GOOGLE_API_KEY
+                        value: ${{ secrets.GOOGLE_API_KEY }}
                     resources:
                       requests:
                         cpu: "50m"
