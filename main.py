@@ -30,9 +30,9 @@ REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LAUNCHPAD_URL = "https://launchpad-smu.apps.innovate.sg-cna.com"
 
-logging.info(f"🔑 REDDIT_CLIENT_ID={REDDIT_CLIENT_ID}")
-logging.info(f"🔑 REDDIT_CLIENT_SECRET={'set' if REDDIT_CLIENT_SECRET else 'MISSING'}")
-logging.info(f"🔑 REDDIT_USER_AGENT={REDDIT_USER_AGENT}")
+# logging.info(f"🔑 REDDIT_CLIENT_ID={REDDIT_CLIENT_ID}")
+# logging.info(f"🔑 REDDIT_CLIENT_SECRET={'set' if REDDIT_CLIENT_SECRET else 'MISSING'}")
+# logging.info(f"🔑 REDDIT_USER_AGENT={REDDIT_USER_AGENT}")
 
 
 class ScrapeRequest(BaseModel):
@@ -91,7 +91,7 @@ senti.setSentiStrengthPath("./SentiStrength.jar")
 senti.setSentiStrengthLanguageFolderPath("./SentiStrengthDataEnglishOctober2019")
 
 # Concurrency controls
-LLM_CONCURRENCY = 5
+LLM_CONCURRENCY = 10
 llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
 
 async def get_llm_reply(text: str):
@@ -117,7 +117,8 @@ async def get_llm_reply_safe(text: str):
 
 async def analyze_and_save(subreddit_name: str, posts: list, buffer: list, batch_size: int = 50):
     """
-    Run sentiment analysis in batch, filter negatives, generate LLM replies, and save.
+    Run sentiment analysis in batch, filter negatives, generate LLM replies concurrently,
+    and save to Supabase in batches.
     """
     if not posts:
         return
@@ -125,24 +126,31 @@ async def analyze_and_save(subreddit_name: str, posts: list, buffer: list, batch
     texts = [p["title"] + " " + p["body"] for p in posts]
 
     try:
-        # Run one JVM call for ALL posts in this subreddit
+        # Run SentiStrength on all posts at once (single JVM call)
         results = await asyncio.to_thread(senti.getSentiment, texts, score="trinary")
     except Exception as e:
         logging.error(f"❌ Error running SentiStrength on r/{subreddit_name}: {e}")
         return
 
-    negative_tasks = []
-    for post, sentiment in zip(posts, results):
-        score = sentiment[1]
-        if score < -2:
-            negative_tasks.append((post, score))
+    negative_posts = [
+        (post, sentiment[1])
+        for post, sentiment in zip(posts, results)
+        if sentiment[1] < -2
+    ]
 
-    logging.info(f"r/{subreddit_name}: {len(negative_tasks)} negative posts out of {len(posts)} scraped.")
+    logging.info(f"r/{subreddit_name}: {len(negative_posts)} negative posts out of {len(posts)} scraped.")
 
-    for post, score in negative_tasks:
-        llm_reply = await get_llm_reply_safe(
-            post["body"].split("\n")[0] if post["body"] else post["title"]
-        )
+    # Prepare all LLM tasks for negative posts
+    llm_tasks = []
+    for post, score in negative_posts:
+        text_for_llm = post["body"].split("\n")[0] if post["body"] else post["title"]
+        llm_tasks.append(get_llm_reply_safe(text_for_llm))
+
+    # Execute LLM calls concurrently, respecting semaphore
+    llm_results = await asyncio.gather(*llm_tasks)
+
+    # Collect results into buffer
+    for (post, score), llm_reply in zip(negative_posts, llm_results):
         buffer.append({
             "username": post["author"],
             "content": post["body"],
@@ -152,58 +160,57 @@ async def analyze_and_save(subreddit_name: str, posts: list, buffer: list, batch
             "suggested_outreach": llm_reply,
         })
 
-    # Batch flush to Supabase
+    # Batch flush to Supabase if buffer is full
     if len(buffer) >= batch_size:
         try:
-            await supabase.table("messages").upsert(
-                buffer,
-                on_conflict=["link"],
-            ).execute()
+            await supabase.table("messages").upsert(buffer, on_conflict=["link"]).execute()
             logging.info(f"💾 Inserted {len(buffer)} rows into Supabase (batch flush).")
             buffer.clear()
         except Exception as e:
             logging.error(f"❌ Error inserting batch into Supabase: {e}")
-            # Optionally, you can decide to clear the buffer even on failure to prevent repeated attempts
             buffer.clear()
 
+
+async def fetch_subreddit(subreddit_name: str, limit: int):
+    """
+    Fetch posts from a subreddit and return structured data.
+    """
+    posts = []
+    try:
+        subreddit = await reddit.subreddit(subreddit_name)
+        async for post in subreddit.new(limit=limit):
+            if post.selftext == "" and post.url != "":
+                continue
+            posts.append({
+                "title": post.title,
+                "body": remove_emojis(post.selftext) or "",
+                "author": str(post.author) if post.author else "[deleted]",
+                "permalink": post.permalink,
+            })
+    except Exception as e:
+        logging.error(f"❌ Error fetching subreddit {subreddit_name}: {e}")
+    return posts
+
 async def main(subreddits: dict[str, int]):
-    """
-    Main entrypoint for scraping and batch sentiment analysis.
-    """
     buffer = []
     errors = []
 
-    for subreddit_name, limit in subreddits.items():
-        logging.info(f"📡 Scraping r/{subreddit_name} (limit={limit})...")
-        posts = []
-        try:
-            subreddit = await reddit.subreddit(subreddit_name)
-            async for post in subreddit.new(limit=limit):
-                if post.selftext =="" and post.url!="":
-                    continue
-                posts.append({
-                    "title": post.title,
-                    "body": remove_emojis(post.selftext) or "",
-                    "author": str(post.author) if post.author else "[deleted]",
-                    "permalink": post.permalink,
-                })
-            
-            # Batch analyze and save after collecting posts
-            await analyze_and_save(subreddit_name, posts, buffer)
+    # Launch all subreddit fetches concurrently
+    fetch_tasks = {name: asyncio.create_task(fetch_subreddit(name, limit)) for name, limit in subreddits.items()}
 
-        except Exception as e:
-            error_message = f"❌ Error fetching subreddit {subreddit_name}: {e}"
-            logging.error(error_message)
-            errors.append(error_message)
+    for name, task in fetch_tasks.items():
+        posts = await task
+        if posts:
+            await analyze_and_save(name, posts, buffer)
+        else:
+            errors.append(f"❌ No posts fetched from r/{name}")
 
-    # Final flush if buffer has leftovers
+    # Final flush
     if buffer:
         try:
-            await supabase.table("messages").upsert(
-                buffer,
-                on_conflict=["link"],
-            ).execute()
+            await supabase.table("messages").upsert(buffer, on_conflict=["link"]).execute()
             logging.info(f"💾 Inserted final {len(buffer)} rows into Supabase.")
+            buffer.clear()
         except Exception as e:
             error_message = f"❌ Error inserting final batch into Supabase: {e}"
             logging.error(error_message)
@@ -223,7 +230,6 @@ async def scrape_subreddits(request: ScrapeRequest):
         if result["errors"]:
             # If there were errors, return a 500 status with the error details
             raise HTTPException(status_code=500, detail={"status": "Scraping completed with errors", "errors": result["errors"]})
-        
         return {"status": "Scraping completed successfully"}
     except HTTPException:
         raise # Re-raise the HTTPException
